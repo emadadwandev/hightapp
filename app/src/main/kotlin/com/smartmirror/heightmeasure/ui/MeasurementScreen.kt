@@ -3,6 +3,7 @@ package com.smartmirror.heightmeasure.ui
 import android.Manifest
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
+import android.util.Log
 import android.util.Size
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -130,14 +131,31 @@ fun MeasurementScreen(
                 .build()
                 .also { it.setAnalyzer(executor, analyzer) }
 
-            val cameraSelector = if (isBackCamera) CameraSelector.DEFAULT_BACK_CAMERA
-                                 else              CameraSelector.DEFAULT_FRONT_CAMERA
+            val provider = cameraProvider ?: return@addListener
+            val availableInfos = provider.availableCameraInfos
+
+            fun has(selector: CameraSelector) =
+                runCatching { provider.hasCamera(selector) }.getOrDefault(false)
+
+            // Selector priority: honor the requested lens-facing when that camera
+            // actually exists, otherwise fall back to the FIRST AVAILABLE camera.
+            // The fallback filters over availableCameraInfos (NOT requireLensFacing)
+            // so an external USB/UVC camera — which reports a null lensFacing and can
+            // never satisfy requireLensFacing — still binds. The front/back toggle
+            // keeps working on devices that actually have those lenses.
+            val cameraSelector = when {
+                isBackCamera  && has(CameraSelector.DEFAULT_BACK_CAMERA)  -> CameraSelector.DEFAULT_BACK_CAMERA
+                !isBackCamera && has(CameraSelector.DEFAULT_FRONT_CAMERA) -> CameraSelector.DEFAULT_FRONT_CAMERA
+                else -> CameraSelector.Builder()
+                    .addCameraFilter { infos -> infos.firstOrNull()?.let { listOf(it) } ?: emptyList() }
+                    .build()
+            }
 
             runCatching {
-                cameraProvider?.unbindAll()
-                val camera = cameraProvider?.bindToLifecycle(
+                provider.unbindAll()
+                val camera = provider.bindToLifecycle(
                     lifecycleOwner, cameraSelector, preview, analysis
-                ) ?: return@runCatching
+                )
 
                 // Derive focal length in pixels from Camera2 sensor intrinsics.
                 // Only meaningful for back camera (accurate intrinsic data);
@@ -156,6 +174,14 @@ fun MeasurementScreen(
                             expState.exposureCompensationRange.upper
                         )
                 }
+            }.onFailure { e ->
+                // Surface the failure instead of swallowing it. Dump what the device
+                // actually exposes so a USB/UVC SBC can be diagnosed via
+                // `adb logcat -s CAMERA_DIAG`.
+                val diag = availableInfos.joinToString(prefix = "[", postfix = "]") { ci ->
+                    "lensFacing=" + runCatching { ci.lensFacing }.getOrNull()
+                }
+                Log.e("CAMERA_DIAG", "bindToLifecycle failed; available cameras: $diag", e)
             }
         }, ContextCompat.getMainExecutor(context))
 
